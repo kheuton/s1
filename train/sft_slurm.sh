@@ -7,7 +7,8 @@ batch_size=16
 weight_decay=1e-4
 train_dataset_name="s1K_tokenized"
 uid="$(date +%Y%m%d_%H%M%S)"
-
+echo "Training with UID: $uid"
+echo "Received arguments: $@"
 # Parse command-line arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -20,7 +21,8 @@ while [[ $# -gt 0 ]]; do
         *) echo "Unknown parameter: $1"; exit 1 ;;
     esac
 done
-
+echo "Training parameters:"
+echo "Learning rate: $lr"
 # Get node information
 node_array=$(scontrol show hostnames $SLURM_JOB_NODELIST)
 nnodes=$(echo $node_array | wc -w)
@@ -37,6 +39,7 @@ grad_acc=$((batch_size/(gpu_count * nnodes)))
 echo "Number of nodes: $nnodes"
 echo "Number of GPUs per node: $gpu_count"
 echo "Head node IP: $head_node_ip"
+echo $HF_CACHE
 # Launch distributed training using srun
 run_name="qwen_${train_dataset_name}_bs${batch_size}_lr${lr}_epoch${epochs}_wd${weight_decay}_${uid}"
 torchrun \
