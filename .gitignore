@@ -2,3 +2,5 @@ ckpts/
 
 wandb/
 
+*.out
+log/
