@@ -56,6 +56,10 @@ torchrun \
     --num_train_epochs=${epochs} \
     --train_file_path="simplescaling/${train_dataset_name}" \
     --model_name="Qwen/Qwen2.5-1.5B-Instruct" \
+    --use_custom_loss True \
+    --loss_type topk_cross_entropy \
+    --topk_k 128 \
+    --topk_temperature 1.0 \
     --warmup_ratio=0.05 \
     --report_to="wandb" \
     --fsdp="full_shard auto_wrap" \
