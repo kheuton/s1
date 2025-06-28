@@ -3,10 +3,10 @@
 #SBATCH --ntasks=2
 #SBATCH --cpus-per-task=48
 #SBATCH --nodes=2
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=256G
-#SBATCH --partition=ccgpu
+#SBATCH --mem=128G
+#SBATCH --partition=gpu
 #SBATCH --time=1-00:00:00
 #SBATCH --output=log/sft_%j.txt  # %j is the job ID
 
@@ -18,9 +18,9 @@ srun --job-name=trains1 \
     --ntasks-per-node=1 \
     --cpus-per-task=16 \
     --account=kheuto01 \
-    --partition=ccgpu \
-    --gres=gpu:4 \
-    --mem=256G \
+    --partition=gpu \
+    --gres=gpu:2 \
+    --mem=128G \
     --time=3-00:00:00 \
     ./train/sft_slurm.sh \
         --uid ${uid} \

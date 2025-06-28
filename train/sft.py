@@ -38,10 +38,14 @@ def create_custom_loss_function(config):
     """
     Factory function to create custom loss functions for use with SFTTrainer's compute_loss_func parameter
     """
-    def custom_loss_func(logits, labels):
+    def custom_loss_func(logits, labels, num_items_in_batch=None):
         """
         Custom loss function that will be called by SFTTrainer's compute_loss method
         Note: logits and labels are already shifted and flattened by the trainer
+        Args:
+            logits: Model logits (already shifted and flattened)
+            labels: Target labels (already shifted and flattened)
+            num_items_in_batch: Number of items in the batch (for potential scaling)
         """
         if not config.use_custom_loss:
             # Return None to use default cross-entropy loss
