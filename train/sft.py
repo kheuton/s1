@@ -34,99 +34,191 @@ class TrainingConfig:
         os.environ['WANDB_ENTITY'] = self.wandb_entity
 
 
-def create_custom_loss_function(config):
-    """
-    Factory function to create custom loss functions for use with SFTTrainer's compute_loss_func parameter
-    """
-    def custom_loss_func(logits, labels, num_items_in_batch=None):
+class CustomSFTTrainer(trl.SFTTrainer):
+    """Custom SFT Trainer with configurable loss functions, based on the original compute_loss method"""
+    
+    def __init__(self, loss_config, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.loss_config = loss_config
+    
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """
-        Custom loss function that will be called by SFTTrainer's compute_loss method
-        Note: logits and labels are already shifted and flattened by the trainer
-        Args:
-            logits: Model logits (already shifted and flattened)
-            labels: Target labels (already shifted and flattened)
-            num_items_in_batch: Number of items in the batch (for potential scaling)
+        How the loss is computed by Trainer. By default, all models return the loss in the first element.
+        Subclass and override for custom behavior.
+        Based on the original SFTTrainer compute_loss method.
         """
-        if not config.use_custom_loss:
-            # Return None to use default cross-entropy loss
-            return None
-        
-        # Debug logging
-        logging.info(f"Custom loss function called with logits shape: {logits.shape}, labels shape: {labels.shape}")
-        
-        # Check for valid tokens (labels != -100)
-        valid_mask = labels != -100
-        total_tokens = len(labels)
-        valid_tokens = valid_mask.sum().item()
-        logging.info(f"Total tokens: {total_tokens}, Valid tokens: {valid_tokens}, Valid ratio: {valid_tokens/total_tokens:.3f}")
-        
-        if not valid_mask.any():
-            logging.warning("No valid tokens found! Returning zero loss.")
-            return torch.tensor(0.0, device=logits.device, requires_grad=True)
-        
-        # Filter to only valid tokens
-        valid_logits = logits[valid_mask]
-        valid_labels = labels[valid_mask]
-        
-        if config.loss_type == "focal":
-            return _focal_loss(valid_logits, valid_labels, config)
-        elif config.loss_type == "label_smoothing":
-            return _label_smoothing_loss(valid_logits, valid_labels, config)
-        elif config.loss_type == "topk_cross_entropy":
-            return _topk_cross_entropy_loss(valid_logits, valid_labels, config)
+        # Original logic: Handle labels and compute_loss_func
+        if (self.label_smoother is not None or self.compute_loss_func is not None) and "labels" in inputs:
+            labels = inputs.pop("labels")
         else:
-            # Default cross entropy
-            return F.cross_entropy(valid_logits, valid_labels)
-    
-    return custom_loss_func
+            labels = None
+            
+        # Original logic: Handle model loss kwargs
+        if self.model_accepts_loss_kwargs:
+            loss_kwargs = {}
+            if num_items_in_batch is not None:
+                loss_kwargs["num_items_in_batch"] = num_items_in_batch
+            inputs = {**inputs, **loss_kwargs}
+            
+        # Original logic: Get model outputs
+        outputs = model(**inputs)
+        
+        # Original logic: Save past state if it exists
+        if self.args.past_index >= 0:
+            self._past = outputs[self.args.past_index]
 
-def _focal_loss(logits, labels, config):
-    """Focal Loss implementation for handling class imbalance"""
-    ce_loss = F.cross_entropy(logits, labels, reduction='none')
-    pt = torch.exp(-ce_loss)
-    focal_loss = config.focal_alpha * (1 - pt) ** config.focal_gamma * ce_loss
-    return focal_loss.mean()
+        if labels is not None:
+            unwrapped_model = self.accelerator.unwrap_model(model)
+            
+            # Check for PEFT model (from original)
+            try:
+                from trl.trainer.sft_trainer import _is_peft_model
+                is_peft = _is_peft_model(unwrapped_model)
+            except ImportError:
+                # Fallback for different TRL versions
+                is_peft = hasattr(unwrapped_model, 'base_model')
+                
+            if is_peft:
+                model_name = unwrapped_model.base_model.model._get_name()
+            else:
+                model_name = unwrapped_model._get_name()
+                
+            # CUSTOM MODIFICATION: Check if we should use custom loss
+            if self.loss_config.use_custom_loss:
+                loss = self._compute_custom_loss(outputs, labels, num_items_in_batch)
+            # Original logic: User-defined compute_loss function
+            elif self.compute_loss_func is not None:
+                loss = self.compute_loss_func(outputs, labels, num_items_in_batch=num_items_in_batch)
+            # Original logic: Use appropriate loss based on model type
+            else:
+                try:
+                    from transformers import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
+                except ImportError:
+                    MODEL_FOR_CAUSAL_LM_MAPPING_NAMES = {}
+                    
+                if model_name in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
+                    loss = self.label_smoother(outputs, labels, shift_labels=True)
+                else:
+                    loss = self.label_smoother(outputs, labels)
+        else:
+            # Original logic: Handle case where no labels
+            if isinstance(outputs, dict) and "loss" not in outputs:
+                raise ValueError(
+                    "The model did not return a loss from the inputs, only the following keys: "
+                    f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
+                )
+            # We don't use .loss here since the model may return tuples instead of ModelOutput.
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
 
-def _label_smoothing_loss(logits, labels, config):
-    """Label smoothing loss implementation"""
-    log_probs = F.log_softmax(logits, dim=-1)
-    nll_loss = F.nll_loss(log_probs, labels, reduction='none')
-    
-    # Apply label smoothing
-    smooth_loss = -log_probs.mean(dim=-1)
-    loss = (1 - config.label_smoothing) * nll_loss + config.label_smoothing * smooth_loss
-    return loss.mean()
+        # Original logic: Handle token averaging across devices
+        if (
+            self.args.average_tokens_across_devices
+            and (self.model_accepts_loss_kwargs or self.compute_loss_func)
+            and num_items_in_batch is not None
+        ):
+            loss *= self.accelerator.num_processes
 
-def _topk_cross_entropy_loss(logits, labels, config):
-    """
-    Top-k cross-entropy loss: rescale probabilities so only top-k predictions have mass
-    """
-    # Apply temperature scaling if specified
-    scaled_logits = logits / config.topk_temperature
+        return (loss, outputs) if return_outputs else loss
     
-    # Ensure k doesn't exceed vocabulary size
-    vocab_size = scaled_logits.size(-1)
-    k = min(config.topk_k, vocab_size)
+    def _compute_custom_loss(self, outputs, labels, num_items_in_batch=None):
+        """
+        Compute custom loss based on configuration.
+        This mimics what the label_smoother would do but with custom loss functions.
+        """
+        try:
+            # Extract logits from outputs
+            if isinstance(outputs, dict):
+                logits = outputs.get("logits")
+            else:
+                logits = outputs[0] if hasattr(outputs, '__getitem__') else outputs.logits
+            
+            if logits is None:
+                raise ValueError("Could not extract logits from model outputs")
+            
+            # Shift labels and logits for causal language modeling (shift_labels=True behavior)
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            
+            # Flatten the tokens
+            shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+            shift_labels = shift_labels.view(-1)
+            
+            # Only compute loss on non-ignored tokens (labels != -100)
+            valid_mask = shift_labels != -100
+            
+            if not valid_mask.any():
+                logging.warning("No valid tokens found! Returning zero loss.")
+                return torch.tensor(0.0, device=logits.device, requires_grad=True)
+            
+            # Filter to only valid tokens
+            valid_logits = shift_logits[valid_mask]
+            valid_labels = shift_labels[valid_mask]
+            
+            # Apply the specific loss function
+            if self.loss_config.loss_type == "focal":
+                return self._focal_loss(valid_logits, valid_labels)
+            elif self.loss_config.loss_type == "label_smoothing":
+                return self._label_smoothing_loss(valid_logits, valid_labels)
+            elif self.loss_config.loss_type == "topk_cross_entropy":
+                return self._topk_cross_entropy_loss(valid_logits, valid_labels)
+            else:
+                # Default cross entropy
+                return F.cross_entropy(valid_logits, valid_labels)
+                
+        except Exception as e:
+            logging.error(f"Error in custom loss computation: {e}")
+            # Fallback to default loss computation using label_smoother
+            return self.label_smoother(outputs, labels, shift_labels=True)
     
-    # Debug logging
-    logging.info(f"Top-k loss: vocab_size={vocab_size}, k={k}, batch_size={logits.size(0)}")
+    def _focal_loss(self, logits, labels):
+        """Focal Loss implementation for handling class imbalance"""
+        ce_loss = F.cross_entropy(logits, labels, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.loss_config.focal_alpha * (1 - pt) ** self.loss_config.focal_gamma * ce_loss
+        return focal_loss.mean()
     
-    # Get top-k values and indices
-    topk_values, topk_indices = torch.topk(scaled_logits, k=k, dim=-1)
+    def _label_smoothing_loss(self, logits, labels):
+        """Label smoothing loss implementation"""
+        log_probs = F.log_softmax(logits, dim=-1)
+        nll_loss = F.nll_loss(log_probs, labels, reduction='none')
+        
+        # Apply label smoothing
+        smooth_loss = -log_probs.mean(dim=-1)
+        loss = (1 - self.loss_config.label_smoothing) * nll_loss + self.loss_config.label_smoothing * smooth_loss
+        return loss.mean()
     
-    # Create a mask for top-k elements
-    topk_mask = torch.zeros_like(scaled_logits, dtype=torch.bool)
-    topk_mask.scatter_(-1, topk_indices, True)
-    
-    # Set non-top-k logits to very negative values (effectively zero probability)
-    masked_logits = scaled_logits.clone()
-    masked_logits[~topk_mask] = float('-inf')
-    
-    # Compute cross-entropy with the masked logits
-    # The softmax will automatically renormalize so top-k probabilities sum to 1
-    loss = F.cross_entropy(masked_logits, labels)
-    logging.info(f"Top-k loss value: {loss.item()}")
-    return loss
+    def _topk_cross_entropy_loss(self, logits, labels):
+        """
+        Top-k cross-entropy loss: rescale probabilities so only top-k predictions have mass
+        """
+        try:
+            # Apply temperature scaling if specified
+            scaled_logits = logits / self.loss_config.topk_temperature
+            
+            # Ensure k doesn't exceed vocabulary size
+            vocab_size = scaled_logits.size(-1)
+            k = min(self.loss_config.topk_k, vocab_size)
+            
+            # Get top-k values and indices
+            topk_values, topk_indices = torch.topk(scaled_logits, k=k, dim=-1)
+            
+            # Create a mask for top-k elements
+            topk_mask = torch.zeros_like(scaled_logits, dtype=torch.bool)
+            topk_mask.scatter_(-1, topk_indices, True)
+            
+            # Set non-top-k logits to very negative values (effectively zero probability)
+            masked_logits = scaled_logits.clone()
+            masked_logits[~topk_mask] = -1e9  # Use -1e9 instead of -inf for numerical stability
+            
+            # Compute cross-entropy with the masked logits
+            loss = F.cross_entropy(masked_logits, labels)
+            
+            return loss
+            
+        except Exception as e:
+            logging.error(f"Error in top-k loss: {e}, falling back to regular cross-entropy")
+            return F.cross_entropy(logits, labels)
+
 
 def train():
     # parsing input
@@ -134,6 +226,13 @@ def train():
     config, args = parser.parse_args_into_dataclasses()
     log_config = {**asdict(config), **asdict(args)}
     logging.info(f"Training config: {log_config}")
+    
+    # Check TRL version for compatibility
+    try:
+        trl_version = trl.__version__
+        logging.info(f"Using TRL version: {trl_version}")
+    except:
+        logging.warning("Could not determine TRL version")
 
     # loading model
     kwargs = {}
@@ -146,7 +245,16 @@ def train():
     else:
         model = transformers.AutoModelForCausalLM.from_pretrained(config.model_name)
 
-    dataset = load_dataset(config.train_file_path)
+    # Load dataset with error handling
+    try:
+        dataset = load_dataset(config.train_file_path)
+        logging.info(f"Loaded dataset with keys: {dataset.keys()}")
+        logging.info(f"Train dataset size: {len(dataset['train'])}")
+        if 'test' in dataset:
+            logging.info(f"Test dataset size: {len(dataset['test'])}")
+    except Exception as e:
+        logging.error(f"Error loading dataset: {e}")
+        raise
 
     # setting up trainer
     tokenizer = transformers.AutoTokenizer.from_pretrained(config.model_name, use_fast=True)
@@ -170,23 +278,31 @@ def train():
         tokenizer=tokenizer,
         mlm=False
     )
-    args.dataset_text_field = 'text'
-    args.max_seq_length = config.block_size
     
-    # Create custom loss function if enabled
-    custom_loss_func = None
+    # Set training arguments (avoid duplicate assignments)
+    if not hasattr(args, 'dataset_text_field') or args.dataset_text_field is None:
+        args.dataset_text_field = 'text'
+    if not hasattr(args, 'max_seq_length') or args.max_seq_length is None:
+        args.max_seq_length = config.block_size
+    
+    # Create trainer - use CustomSFTTrainer if custom loss is enabled
     if config.use_custom_loss:
-        custom_loss_func = create_custom_loss_function(config)
-    
-    # Create trainer with optional custom loss function
-    trainer = trl.SFTTrainer(
-        model,
-        train_dataset=dataset['train'],
-        eval_dataset=dataset['test'] if 'test' in dataset else dataset['train'],
-        args=args,
-        data_collator=collator,
-        compute_loss_func=custom_loss_func  # This is the key parameter!
-    )
+        trainer = CustomSFTTrainer(
+            loss_config=config,
+            model=model,
+            train_dataset=dataset['train'],
+            eval_dataset=dataset['test'] if 'test' in dataset  else dataset['train'],
+            args=args,
+            data_collator=collator,
+        )
+    else:
+        trainer = trl.SFTTrainer(
+            model,
+            train_dataset=dataset['train'],
+            eval_dataset=dataset['test'] if 'test' in dataset else dataset['train'],
+            args=args,
+            data_collator=collator,
+        )
 
     trainer.train()
     trainer.save_model(output_dir=args.output_dir)
