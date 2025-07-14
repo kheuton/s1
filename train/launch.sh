@@ -6,9 +6,10 @@
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=256G
-#SBATCH --partition=ccgpu
+#SBATCH --partition=gpu
 #SBATCH --time=1-00:00:00
 #SBATCH --output=log/sft_%j.txt  # %j is the job ID
+#SBATCH --nodelist=cc1gpu[002,003]
 
 uid="$(date +%Y%m%d-%H%M%S)"
 echo $HF_CACHE
@@ -18,7 +19,7 @@ srun --job-name=trains1 \
     --ntasks-per-node=1 \
     --cpus-per-task=16 \
     --account=kheuto01 \
-    --partition=ccgpu \
+    --partition=gpu \
     --gres=gpu:4 \
     --mem=256G \
     --time=3-00:00:00 \

@@ -29,8 +29,11 @@ nnodes=$(echo $node_array | wc -w)
 head_node=($node_array)
 head_node_ip=$(ssh $head_node hostname --ip-address)
 export NCCL_DEBUG=INFO
-export NCCL_TIMEOUT=3600
-
+export NCCL_TIMEOUT=7200
+export NCCL_BLOCKING_WAIT=1
+export NCCL_ASYNC_ERROR_HANDLING=1
+export TORCH_NCCL_BLOCKING_WAIT=1
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 
 # Calculate gradient accumulation steps
 gpu_count=$(nvidia-smi -L | wc -l)
